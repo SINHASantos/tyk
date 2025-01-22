@@ -1,16 +1,31 @@
 package gateway
 
 import (
+	"context"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/getkin/kin-openapi/openapi3"
+
 	"github.com/getkin/kin-openapi/openapi3filter"
-	"github.com/getkin/kin-openapi/routers/gorillamux"
 )
 
+func init() {
+	openapi3.SchemaErrorDetailsDisabled = true
+	openapi3.DefineStringFormatCallback("date-time", func(value string) error {
+		_, err := time.Parse(time.RFC3339, value)
+		return err
+	})
+
+	openapi3.DefineStringFormatCallback("date", func(value string) error {
+		_, err := time.Parse(time.DateOnly, value)
+		return err
+	})
+}
+
 type ValidateRequest struct {
-	BaseMiddleware
+	*BaseMiddleware
 }
 
 func (k *ValidateRequest) Name() string {
@@ -37,6 +52,7 @@ func (k *ValidateRequest) EnabledForSpec() bool {
 		}
 
 		if operation.ValidateRequest.Enabled {
+			k.Spec.HasValidateRequest = true
 			return true
 		}
 	}
@@ -46,31 +62,8 @@ func (k *ValidateRequest) EnabledForSpec() bool {
 
 // ProcessRequest will run any checks on the request on the way through the system, return an error to have the chain fail
 func (k *ValidateRequest) ProcessRequest(w http.ResponseWriter, r *http.Request, _ interface{}) (error, int) {
-	versionInfo, _ := k.Spec.Version(r)
-	versionPaths := k.Spec.RxPaths[versionInfo.Name]
-	found, _ := k.Spec.CheckSpecMatchesStatus(r, versionPaths, ValidateRequestWithOAS)
-	if !found {
-		return nil, http.StatusOK
-	}
-
-	// replacing servers object to just have listen path so that router.FindRoute(r) will not fail with strict hostname check
-	oasSpec := k.Spec.OAS.T
-	oasSpec.Servers = openapi3.Servers{
-		{URL: k.Spec.Proxy.ListenPath},
-	}
-
-	router, err := gorillamux.NewRouter(&oasSpec)
-	if err != nil {
-		return nil, http.StatusOK
-	}
-
-	route, pathParams, err := router.FindRoute(r)
-	if err != nil {
-		return nil, http.StatusOK
-	}
-
-	operation, ok := k.Spec.OAS.GetTykExtension().Middleware.Operations[route.Operation.OperationID]
-	if !ok {
+	operation := ctxGetOperation(r)
+	if operation == nil {
 		return nil, http.StatusOK
 	}
 
@@ -87,13 +80,18 @@ func (k *ValidateRequest) ProcessRequest(w http.ResponseWriter, r *http.Request,
 	// Validate request
 	requestValidationInput := &openapi3filter.RequestValidationInput{
 		Request:    r,
-		PathParams: pathParams,
-		Route:      route,
+		PathParams: operation.pathParams,
+		Route:      operation.route,
+		Options: &openapi3filter.Options{
+			AuthenticationFunc: func(ctx context.Context, input *openapi3filter.AuthenticationInput) error {
+				return nil
+			},
+		},
 	}
 
-	err = openapi3filter.ValidateRequestBody(r.Context(), requestValidationInput, route.Operation.RequestBody.Value)
+	err := openapi3filter.ValidateRequest(r.Context(), requestValidationInput)
 	if err != nil {
-		return fmt.Errorf("request validation error: %v", err), errResponseCode
+		return fmt.Errorf("request validation error: %w", err), errResponseCode
 	}
 
 	// Handle Success
