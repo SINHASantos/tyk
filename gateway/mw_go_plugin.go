@@ -2,20 +2,22 @@ package gateway
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"net/http"
-	"path/filepath"
-	"runtime"
-	"strings"
 	"time"
+
+	"github.com/TykTechnologies/tyk/apidef/oas"
+
+	"github.com/TykTechnologies/tyk/ctx"
 
 	"github.com/TykTechnologies/tyk-pump/analytics"
 	"github.com/TykTechnologies/tyk/apidef"
 
 	"github.com/sirupsen/logrus"
 
-	"github.com/TykTechnologies/tyk/ctx"
 	"github.com/TykTechnologies/tyk/goplugin"
 	"github.com/TykTechnologies/tyk/request"
 )
@@ -89,7 +91,8 @@ func (w *customResponseWriter) getHttpResponse(r *http.Request) *http.Response {
 
 // GoPluginMiddleware is a generic middleware that will execute Go-plugin code before continuing
 type GoPluginMiddleware struct {
-	BaseMiddleware
+	*BaseMiddleware
+
 	Path           string // path to .so file
 	SymbolName     string // function symbol to look up
 	handler        http.HandlerFunc
@@ -112,18 +115,20 @@ func (m *GoPluginMiddleware) EnabledForSpec() bool {
 
 	// per path go plugins
 	for _, version := range m.Spec.VersionData.Versions {
-		if len(version.ExtendedPaths.GoPlugin) > 0 {
-			return true
+		for _, p := range version.ExtendedPaths.GoPlugin {
+			if !p.Disabled {
+				return true
+			}
 		}
 	}
 
 	return false
 }
 
-// loadPlugin loads the plugin file from m.Path, it will try with:
-// m.path which can be {plugin_name}.so
-// if the file doesn't exist then it will try converting it to the tyk version aware format: {plugin_name}_{tyk_version}_{os}_{arch}.so
-// later if the file still doesn't exist then it will try again but ensuring that the version contains the prefix 'v'
+// loadPlugin loads the plugin file from m.Path, it will try
+// converting it to the tyk version aware format: {plugin_name}_{tyk_version}_{os}_{arch}.so
+// if the file doesn't exist then it will again but with a gw version that is not prefixed by 'v'
+// later, it will try with m.path which can be {plugin_name}.so
 func (m *GoPluginMiddleware) loadPlugin() bool {
 	m.logger = log.WithFields(logrus.Fields{
 		"mwPath":       m.Path,
@@ -138,15 +143,12 @@ func (m *GoPluginMiddleware) loadPlugin() bool {
 	// try to load plugin
 	var err error
 
-	if !FileExist(m.Path) {
-		// if the exact name doesn't exist then try to load it using tyk version
-		newPath := m.getPluginNameFromTykVersion(VERSION)
-
-		prefixedVersion := getPrefixedVersion(VERSION)
-		if !FileExist(newPath) && VERSION != prefixedVersion {
-			// if the file doesn't exist yet, then lets try with version in the format: v.x.x.x
-			newPath = m.getPluginNameFromTykVersion(prefixedVersion)
-		}
+	newPath, err := goplugin.GetPluginFileNameToLoad(goplugin.FileSystemStorage{}, m.Path)
+	if err != nil {
+		m.logger.WithError(err).Error("plugin file not found")
+		return false
+	}
+	if m.Path != newPath {
 		m.Path = newPath
 	}
 
@@ -163,7 +165,7 @@ func (m *GoPluginMiddleware) loadPlugin() bool {
 	}
 
 	// to record 2XX hits in analytics
-	m.successHandler = &SuccessHandler{BaseMiddleware: m.BaseMiddleware}
+	m.successHandler = &SuccessHandler{BaseMiddleware: m.BaseMiddleware.Copy()}
 	return true
 }
 
@@ -178,16 +180,24 @@ func (m *GoPluginMiddleware) goPluginFromRequest(r *http.Request) (*GoPluginMidd
 	return perPathPerMethodGoPlugin.(*GoPluginMiddleware), found
 }
 func (m *GoPluginMiddleware) ProcessRequest(w http.ResponseWriter, r *http.Request, conf interface{}) (err error, respCode int) {
-	// if a Go plugin is found for this path, override the base handler and logger:
 	logger := m.logger
 	handler := m.handler
+	successHandler := m.successHandler
+
 	if !m.APILevel {
+		// if a Go plugin is found for this path, override the base handler and logger
 		if pluginMw, found := m.goPluginFromRequest(r); found {
 			logger = pluginMw.logger
 			handler = pluginMw.handler
+			successHandler = &SuccessHandler{BaseMiddleware: m.BaseMiddleware.Copy()}
+		} else {
+			return nil, http.StatusOK // next middleware
 		}
 	}
+
 	if handler == nil {
+		respCode = http.StatusInternalServerError
+		err = errors.New(http.StatusText(respCode))
 		return
 	}
 
@@ -215,8 +225,19 @@ func (m *GoPluginMiddleware) ProcessRequest(w http.ResponseWriter, r *http.Reque
 	t1 := time.Now()
 
 	// Inject definition into request context:
-	ctx.SetDefinition(r, m.Spec.APIDefinition)
+	if m.Spec.IsOAS {
+		setOASDefinition(r, &m.Spec.OAS)
+	} else {
+		ctx.SetDefinition(r, m.Spec.APIDefinition)
+	}
+
 	handler(rw, r)
+	if session := ctxGetSession(r); session != nil {
+		if err := m.ApplyPolicies(session); err != nil {
+			m.Logger().WithError(err).Error("Could not apply policy to session")
+			return errors.New(http.StatusText(http.StatusInternalServerError)), http.StatusInternalServerError
+		}
+	}
 
 	// calculate latency
 	ms := DurationToMillisecond(time.Since(t1))
@@ -242,7 +263,7 @@ func (m *GoPluginMiddleware) ProcessRequest(w http.ResponseWriter, r *http.Reque
 			logger.WithError(err).Error("Failed to process request with Go-plugin middleware func")
 		default:
 			// record 2XX to analytics
-			m.successHandler.RecordHit(r, analytics.Latency{Total: int64(ms)}, rw.statusCodeSent, rw.getHttpResponse(r))
+			successHandler.RecordHit(r, analytics.Latency{Total: int64(ms)}, rw.statusCodeSent, rw.getHttpResponse(r), false)
 
 			// no need to continue passing this request down to reverse proxy
 			respCode = mwStatusRespond
@@ -254,36 +275,8 @@ func (m *GoPluginMiddleware) ProcessRequest(w http.ResponseWriter, r *http.Reque
 	return
 }
 
-// getPluginNameFromTykVersion builds a name of plugin based on tyk version
-// os and architecture. The structure of the plugin name looks like:
-// {plugin-dir}/{plugin-name}_{GW-version}_{OS}_{arch}.so
-func (m *GoPluginMiddleware) getPluginNameFromTykVersion(version string) string {
-	if m.Path == "" {
-		return ""
-	}
-
-	pluginDir := filepath.Dir(m.Path)
-	// remove plugin extension to have the plugin's clean name
-	pluginName := strings.TrimSuffix(filepath.Base(m.Path), ".so")
-	os := runtime.GOOS
-	architecture := runtime.GOARCH
-
-	// sanitize away `-rc15` suffixes (remove `-*`) from version
-	vs := strings.Split(version, "-")
-	if len(vs) > 0 {
-		version = vs[0]
-	}
-
-	newPluginName := strings.Join([]string{pluginName, version, os, architecture}, "_")
-	newPluginPath := pluginDir + "/" + newPluginName + ".so"
-
-	return newPluginPath
-}
-
-// getPrefixedVersion receives a version and check that it has the prefix 'v' otherwise, it adds it
-func getPrefixedVersion(version string) string {
-	if !strings.HasPrefix(version, "v") {
-		version = "v" + version
-	}
-	return version
+func setOASDefinition(r *http.Request, s *oas.OAS) {
+	cntx := r.Context()
+	cntx = context.WithValue(cntx, ctx.OASDefinition, s)
+	setContext(r, cntx)
 }

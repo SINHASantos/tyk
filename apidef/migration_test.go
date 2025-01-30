@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+
+	"github.com/TykTechnologies/tyk/internal/event"
 )
 
 const (
@@ -26,21 +28,42 @@ var testV1ExtendedPaths = ExtendedPathsSet{
 	WhiteList: []EndPointMeta{
 		{Method: http.MethodGet, Path: "/get1"},
 	},
+	TransformResponse: []TemplateMeta{
+		{
+			Method: http.MethodGet, Path: "/transform1",
+			TemplateData: TemplateData{
+				EnableSession:  true,
+				Mode:           UseBlob,
+				TemplateSource: `{"http_method":"{{.Method}}"}`,
+				Input:          RequestJSON,
+			}},
+	},
 }
 
 var testV2ExtendedPaths = ExtendedPathsSet{
 	WhiteList: []EndPointMeta{
 		{Method: http.MethodGet, Path: "/get2"},
 	},
+	TransformResponse: []TemplateMeta{
+		{
+			Method: http.MethodGet, Path: "/transform2",
+			TemplateData: TemplateData{
+				EnableSession:  true,
+				Mode:           UseBlob,
+				TemplateSource: `{"http_method":"{{.Method}}"}`,
+				Input:          RequestJSON,
+			}},
+	},
 }
 
 func oldTestAPI() APIDefinition {
 	return APIDefinition{
-		Id:     dbID,
-		APIID:  apiID,
-		Name:   baseAPIName,
-		Active: true,
-		Proxy:  ProxyConfig{TargetURL: baseTarget, ListenPath: listenPath},
+		Id:        dbID,
+		APIID:     apiID,
+		Name:      baseAPIName,
+		Active:    true,
+		UseOauth2: true,
+		Proxy:     ProxyConfig{TargetURL: baseTarget, ListenPath: listenPath},
 		VersionDefinition: VersionDefinition{
 			Location:  URLLocation,
 			Key:       key,
@@ -63,34 +86,44 @@ func oldTestAPI() APIDefinition {
 			},
 		},
 		AuthConfigs: map[string]AuthConfig{
-			"authToken": {
+			AuthTokenType: {
 				AuthHeaderName: "Authorization",
 				UseParam:       true,
 				ParamName:      "Authorization",
 				UseCookie:      true,
 				CookieName:     "Authorization",
 			},
-			"jwt": {
+			OAuthType: {
 				AuthHeaderName: "Authorization",
 				UseParam:       true,
 				ParamName:      "Authorization",
 				UseCookie:      true,
 				CookieName:     "Authorization",
 			},
-			"oidc": {
+			JWTType: {
 				AuthHeaderName: "Authorization",
 				UseParam:       true,
 				ParamName:      "Authorization",
 				UseCookie:      true,
 				CookieName:     "Authorization",
 			},
-			"hmac": {
+			OIDCType: {
 				AuthHeaderName: "Authorization",
 				UseParam:       true,
 				ParamName:      "Authorization",
 				UseCookie:      true,
 				CookieName:     "Authorization",
 			},
+			HMACType: {
+				AuthHeaderName: "Authorization",
+				UseParam:       true,
+				ParamName:      "Authorization",
+				UseCookie:      true,
+				CookieName:     "Authorization",
+			},
+		},
+		ResponseProcessors: []ResponseProcessor{
+			{Name: ResponseProcessorResponseBodyTransform},
 		},
 	}
 }
@@ -129,10 +162,11 @@ func TestAPIDefinition_MigrateVersioning(t *testing.T) {
 	expectedVersion.Id = ""
 	expectedVersion.APIID = versions[0].APIID
 	expectedVersion.Name += "-" + v2
+	expectedVersion.VersionName = v2
 	expectedVersion.Internal = true
 	expectedVersion.Expiration = exp2
 	expectedVersion.Proxy.ListenPath += "-" + v2 + "/"
-	expectedVersion.VersionDefinition = VersionDefinition{}
+	expectedVersion.VersionDefinition = VersionDefinition{BaseID: apiID}
 	expectedVersion.VersionData = VersionData{
 		NotVersioned: true,
 		Versions: map[string]VersionInfo{
@@ -163,11 +197,7 @@ func TestAPIDefinition_MigrateVersioning_Disabled(t *testing.T) {
 		assert.NoError(t, err)
 		assert.Nil(t, versions)
 
-		expectedBaseDefinition := VersionDefinition{
-			Location:            URLLocation,
-			Key:                 key,
-			StripVersioningData: true,
-		}
+		expectedBaseDefinition := VersionDefinition{}
 
 		assert.Equal(t, expectedBaseDefinition, base.VersionDefinition)
 
@@ -218,6 +248,8 @@ func TestAPIDefinition_MigrateVersioning_DefaultEmpty(t *testing.T) {
 	assert.Equal(t, expectedBaseData, base.VersionData)
 
 	// v2
+	assert.Equal(t, apiID, versions[0].VersionDefinition.BaseID)
+	versions[0].VersionDefinition.BaseID = ""
 	assert.Empty(t, versions[0].VersionDefinition)
 
 	expectedV2Data := VersionData{
@@ -319,6 +351,7 @@ func TestAPIDefinition_MigrateVersioning_StripPath(t *testing.T) {
 	}
 
 	check := func(t *testing.T, base APIDefinition, stripVersioningData bool) {
+		t.Helper()
 		versions, err := base.MigrateVersioning()
 		assert.NoError(t, err)
 
@@ -503,4 +536,380 @@ func TestAPIDefinition_MigrateAuthConfigNames(t *testing.T) {
 	for k, v := range base.AuthConfigs {
 		assert.Equal(t, k, v.Name)
 	}
+}
+
+func TestAPIDefinition_MigrateAuthentication(t *testing.T) {
+	base := oldTestAPI()
+	_, err := base.Migrate()
+	assert.NoError(t, err)
+
+	assert.Len(t, base.AuthConfigs, 1)
+	assert.Contains(t, base.AuthConfigs, OAuthType)
+}
+
+func TestAPIDefinition_isAuthTokenEnabled(t *testing.T) {
+	api := APIDefinition{UseKeylessAccess: false}
+	assert.True(t, api.isAuthTokenEnabled())
+
+	api.EnableJWT = true
+	assert.False(t, api.isAuthTokenEnabled())
+
+	api.UseKeylessAccess = true
+	api.EnableJWT = false
+	api.UseStandardAuth = true
+	assert.True(t, api.isAuthTokenEnabled())
+}
+
+func TestAPIDefinition_deleteAuthConfigsNotUsed(t *testing.T) {
+	api := APIDefinition{
+		UseKeylessAccess: true,
+		AuthConfigs: map[string]AuthConfig{
+			AuthTokenType:     {},
+			JWTType:           {},
+			HMACType:          {},
+			BasicType:         {},
+			CoprocessType:     {},
+			OAuthType:         {},
+			ExternalOAuthType: {},
+			OIDCType:          {},
+		},
+	}
+
+	api.deleteAuthConfigsNotUsed()
+	assert.Len(t, api.AuthConfigs, 0)
+}
+
+func TestAPIDefinition_migrateCustomPluginAuth(t *testing.T) {
+	testCases := []struct {
+		name           string
+		apiDef         APIDefinition
+		expectedAPIDef APIDefinition
+	}{
+		{
+			name:   "goplugin",
+			apiDef: APIDefinition{UseGoPluginAuth: true},
+			expectedAPIDef: APIDefinition{
+				UseGoPluginAuth:         false,
+				CustomPluginAuthEnabled: true,
+			},
+		},
+		{
+			name:   "coprocess",
+			apiDef: APIDefinition{EnableCoProcessAuth: true},
+			expectedAPIDef: APIDefinition{
+				EnableCoProcessAuth:     false,
+				CustomPluginAuthEnabled: true,
+			},
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.apiDef.migrateCustomPluginAuth()
+			assert.Equal(t, tc.expectedAPIDef, tc.apiDef)
+		})
+	}
+}
+
+func TestSetDisabledFlags(t *testing.T) {
+	apiDef := APIDefinition{
+		CustomMiddleware: MiddlewareSection{
+			Pre:         make([]MiddlewareDefinition, 1),
+			PostKeyAuth: make([]MiddlewareDefinition, 1),
+			Post:        make([]MiddlewareDefinition, 1),
+			Response:    make([]MiddlewareDefinition, 1),
+		},
+		VersionData: VersionData{
+			Versions: map[string]VersionInfo{
+				"": {
+					ExtendedPaths: ExtendedPathsSet{
+						Virtual:  make([]VirtualMeta, 2),
+						GoPlugin: make([]GoPluginMeta, 1),
+					},
+				},
+			},
+		},
+		EventHandlers: EventHandlerMetaConfig{
+			Events: map[TykEvent][]EventHandlerTriggerConfig{
+				event.QuotaExceeded: {
+					{
+						Handler: event.WebHookHandler,
+						HandlerMeta: map[string]interface{}{
+							"target_path": "https://webhook.site/uuid",
+						},
+					},
+				},
+			},
+		},
+	}
+	expectedAPIDef := APIDefinition{
+		DisableExpireAnalytics: true,
+		CustomMiddleware: MiddlewareSection{
+			AuthCheck: MiddlewareDefinition{
+				Disabled: true,
+			},
+			Pre: []MiddlewareDefinition{
+				{
+					Disabled: true,
+				},
+			},
+			PostKeyAuth: []MiddlewareDefinition{
+				{
+					Disabled: true,
+				},
+			},
+			Post: []MiddlewareDefinition{
+				{
+					Disabled: true,
+				},
+			},
+			Response: []MiddlewareDefinition{
+				{
+					Disabled: true,
+				},
+			},
+			IdExtractor: MiddlewareIdExtractor{
+				Disabled: true,
+			},
+		},
+		TagsDisabled:                   true,
+		UpstreamCertificatesDisabled:   true,
+		CertificatePinningDisabled:     true,
+		DomainDisabled:                 true,
+		CustomMiddlewareBundleDisabled: true,
+		ConfigDataDisabled:             true,
+		SessionLifetimeDisabled:        true,
+		Proxy: ProxyConfig{
+			ServiceDiscovery: ServiceDiscoveryConfiguration{
+				CacheDisabled: true,
+			},
+		},
+		UptimeTests: UptimeTests{
+			Config: UptimeTestsConfig{
+				ServiceDiscovery: ServiceDiscoveryConfiguration{
+					CacheDisabled: true,
+				},
+			},
+		},
+		VersionData: VersionData{
+			Versions: map[string]VersionInfo{
+				"": {
+					ExtendedPaths: ExtendedPathsSet{
+						Virtual: []VirtualMeta{
+							{
+								Disabled: true,
+							},
+							{
+								Disabled: true,
+							},
+						},
+						GoPlugin: []GoPluginMeta{
+							{
+								Disabled: true,
+							},
+						},
+					},
+				},
+			},
+		},
+		GlobalRateLimit: GlobalRateLimit{
+			Disabled: true,
+		},
+		EventHandlers: EventHandlerMetaConfig{
+			Events: map[event.Event][]EventHandlerTriggerConfig{
+				event.QuotaExceeded: {
+					{
+						Handler: event.WebHookHandler,
+						HandlerMeta: map[string]interface{}{
+							"target_path": "https://webhook.site/uuid",
+							"disabled":    true,
+						},
+					},
+				},
+			},
+		},
+		DoNotTrack: true,
+	}
+	apiDef.SetDisabledFlags()
+	assert.Equal(t, expectedAPIDef, apiDef)
+	assert.EqualValues(t, expectedAPIDef.EventHandlers, apiDef.EventHandlers)
+}
+
+func TestAPIDefinition_migrateIDExtractor(t *testing.T) {
+	base := oldTestAPI()
+	_, err := base.Migrate()
+	assert.NoError(t, err)
+
+	assert.True(t, base.CustomMiddleware.IdExtractor.Disabled)
+}
+
+func TestAPIDefinition_migratePluginConfigData(t *testing.T) {
+	base := oldTestAPI()
+	_, err := base.Migrate()
+	assert.NoError(t, err)
+
+	assert.True(t, base.ConfigDataDisabled)
+}
+
+func TestAPIDefinition_migrateScopeToPolicy(t *testing.T) {
+	var (
+		scopeName            = "scope"
+		scopeToPolicyMapping = map[string]string{"claim1": "pol1"}
+	)
+
+	expectedScopeClaim := ScopeClaim{
+		ScopeClaimName: scopeName,
+		ScopeToPolicy:  scopeToPolicyMapping,
+	}
+
+	check := func(t *testing.T, jwtScopeClaimName string, jwtScopeToPolicyMapping map[string]string, scopeClaim ScopeClaim) {
+		t.Helper()
+		assert.Equal(t, expectedScopeClaim, scopeClaim)
+		assert.Empty(t, jwtScopeClaimName)
+		assert.Nil(t, jwtScopeToPolicyMapping)
+	}
+
+	t.Run("jwt", func(t *testing.T) {
+		apiDef := APIDefinition{
+			JWTScopeClaimName:       scopeName,
+			JWTScopeToPolicyMapping: scopeToPolicyMapping,
+		}
+
+		_, err := apiDef.Migrate()
+		assert.NoError(t, err)
+		check(t, apiDef.JWTScopeClaimName, apiDef.JWTScopeToPolicyMapping, apiDef.Scopes.JWT)
+	})
+
+	t.Run("oidc", func(t *testing.T) {
+		apiDef := APIDefinition{
+			UseOpenID:               true,
+			JWTScopeClaimName:       scopeName,
+			JWTScopeToPolicyMapping: scopeToPolicyMapping,
+		}
+
+		_, err := apiDef.Migrate()
+		assert.NoError(t, err)
+		check(t, apiDef.JWTScopeClaimName, apiDef.JWTScopeToPolicyMapping, apiDef.Scopes.OIDC)
+	})
+
+}
+
+func TestAPIDefinition_migrateResponseProcessors(t *testing.T) {
+	base := oldTestAPI()
+	_, err := base.Migrate()
+	assert.NoError(t, err)
+
+	assert.Empty(t, base.ResponseProcessors)
+}
+
+func TestAPIDefinition_migrateGlobalRateLimit(t *testing.T) {
+	t.Run("per=0,rate=0", func(t *testing.T) {
+		base := oldTestAPI()
+		_, err := base.Migrate()
+		assert.NoError(t, err)
+
+		assert.True(t, base.GlobalRateLimit.Disabled)
+	})
+
+	t.Run("per!=0,rate=0", func(t *testing.T) {
+		base := oldTestAPI()
+		base.GlobalRateLimit.Per = 120
+		_, err := base.Migrate()
+		assert.NoError(t, err)
+
+		assert.True(t, base.GlobalRateLimit.Disabled)
+	})
+
+	t.Run("per=0,rate!=0", func(t *testing.T) {
+		base := oldTestAPI()
+		base.GlobalRateLimit.Rate = 1
+		_, err := base.Migrate()
+		assert.NoError(t, err)
+
+		assert.True(t, base.GlobalRateLimit.Disabled)
+	})
+
+	t.Run("per!=0,rate!=0", func(t *testing.T) {
+		base := oldTestAPI()
+		base.GlobalRateLimit.Rate = 1
+		base.GlobalRateLimit.Per = 1
+		_, err := base.Migrate()
+		assert.NoError(t, err)
+
+		assert.False(t, base.GlobalRateLimit.Disabled)
+	})
+}
+
+func TestAPIDefinition_migrateIPAccessControl(t *testing.T) {
+	t.Run("whitelisting", func(t *testing.T) {
+		t.Run("EnableIpWhitelisting=true, no whitelist", func(t *testing.T) {
+			base := oldTestAPI()
+			base.EnableIpWhiteListing = true
+			_, err := base.Migrate()
+			assert.NoError(t, err)
+			assert.True(t, base.IPAccessControlDisabled)
+		})
+
+		t.Run("IPWhiteListEnabled=true, non-empty whitelist", func(t *testing.T) {
+			base := oldTestAPI()
+			base.EnableIpWhiteListing = true
+			base.AllowedIPs = []string{"127.0.0.1"}
+			_, err := base.Migrate()
+			assert.NoError(t, err)
+			assert.False(t, base.IPAccessControlDisabled)
+		})
+
+		t.Run("EnableIpWhitelisting=false, no whitelist", func(t *testing.T) {
+			base := oldTestAPI()
+			base.EnableIpWhiteListing = false
+			_, err := base.Migrate()
+			assert.NoError(t, err)
+			assert.True(t, base.IPAccessControlDisabled)
+		})
+
+		t.Run("IPWhiteListEnabled=false, non-empty whitelist", func(t *testing.T) {
+			base := oldTestAPI()
+			base.EnableIpWhiteListing = false
+			base.AllowedIPs = []string{"127.0.0.1"}
+			_, err := base.Migrate()
+			assert.NoError(t, err)
+			assert.True(t, base.IPAccessControlDisabled)
+		})
+	})
+
+	t.Run("blacklisting", func(t *testing.T) {
+		t.Run("EnableIpBlacklisting=true, no blacklist", func(t *testing.T) {
+			base := oldTestAPI()
+			base.EnableIpBlacklisting = true
+			_, err := base.Migrate()
+			assert.NoError(t, err)
+			assert.True(t, base.IPAccessControlDisabled)
+		})
+
+		t.Run("EnableIpBlacklisting=true, non-empty blacklist", func(t *testing.T) {
+			base := oldTestAPI()
+			base.EnableIpBlacklisting = true
+			base.BlacklistedIPs = []string{"127.0.0.1"}
+			_, err := base.Migrate()
+			assert.NoError(t, err)
+			assert.False(t, base.IPAccessControlDisabled)
+		})
+
+		t.Run("EnableIpBlacklisting=false, no blacklist", func(t *testing.T) {
+			base := oldTestAPI()
+			base.EnableIpBlacklisting = false
+			_, err := base.Migrate()
+			assert.NoError(t, err)
+			assert.True(t, base.IPAccessControlDisabled)
+		})
+
+		t.Run("IPWhiteListEnabled=false, non-empty blacklist", func(t *testing.T) {
+			base := oldTestAPI()
+			base.EnableIpBlacklisting = false
+			base.BlacklistedIPs = []string{"127.0.0.1"}
+			_, err := base.Migrate()
+			assert.NoError(t, err)
+			assert.True(t, base.IPAccessControlDisabled)
+		})
+	})
+
 }

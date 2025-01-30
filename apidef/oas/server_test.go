@@ -10,17 +10,38 @@ import (
 )
 
 func TestServer(t *testing.T) {
-	t.Parallel()
+	t.Run("empty", func(t *testing.T) {
+		t.Parallel()
 
-	var emptyServer Server
+		var emptyServer Server
 
-	var convertedAPI apidef.APIDefinition
-	emptyServer.ExtractTo(&convertedAPI)
+		var convertedAPI apidef.APIDefinition
+		convertedAPI.SetDisabledFlags()
+		emptyServer.ExtractTo(&convertedAPI)
 
-	var resultServer Server
-	resultServer.Fill(convertedAPI)
+		var resultServer Server
+		resultServer.Fill(convertedAPI)
 
-	assert.Equal(t, emptyServer, resultServer)
+		assert.Equal(t, emptyServer, resultServer)
+	})
+
+	t.Run("port protocol", func(t *testing.T) {
+		var server = Server{
+			Port:     3000,
+			Protocol: "http",
+		}
+		var convertedAPI apidef.APIDefinition
+		var resultServer Server
+
+		server.ExtractTo(&convertedAPI)
+
+		assert.Equal(t, server.Port, convertedAPI.ListenPort)
+		assert.Equal(t, server.Protocol, convertedAPI.Protocol)
+
+		resultServer.Fill(convertedAPI)
+		assert.Equal(t, server, resultServer)
+	})
+
 }
 
 func TestListenPath(t *testing.T) {
@@ -47,12 +68,12 @@ func TestGatewayTags(t *testing.T) {
 	}{
 		{
 			input: GatewayTags{},
-			want:  GatewayTags{Tags: []string{}},
+			want:  GatewayTags{},
 			omit:  true,
 		},
 		{
 			input: GatewayTags{Enabled: true},
-			want:  GatewayTags{Enabled: true, Tags: []string{}},
+			want:  GatewayTags{Enabled: true},
 		},
 		{
 			input: GatewayTags{Enabled: true, Tags: []string{}},
@@ -73,9 +94,6 @@ func TestGatewayTags(t *testing.T) {
 	}
 
 	t.Run("Fill GatewayTags from APIDef", func(t *testing.T) {
-		// We currently don't match APIDef direct fill with OAS
-		t.Skip() // TODO: TT-5720
-
 		t.Parallel()
 
 		for idx, tc := range testcases {
@@ -126,6 +144,7 @@ func TestClientCertificates(t *testing.T) {
 }
 
 func TestCustomDomain(t *testing.T) {
+	certs := []string{"c1", "c2"}
 	t.Run("extractTo api definition", func(t *testing.T) {
 		testcases := []struct {
 			title       string
@@ -135,12 +154,12 @@ func TestCustomDomain(t *testing.T) {
 			{
 				"enabled=false, name=nil",
 				Domain{Enabled: false, Name: ""},
-				apidef.APIDefinition{},
+				apidef.APIDefinition{DomainDisabled: true},
 			},
 			{
-				"enabled=false, name=(valid-domain)",
-				Domain{Enabled: false, Name: "example.com"},
-				apidef.APIDefinition{DomainDisabled: true, Domain: "example.com"},
+				"enabled=false, vali",
+				Domain{Enabled: false, Name: "example.com", Certificates: certs},
+				apidef.APIDefinition{DomainDisabled: true, Domain: "example.com", Certificates: certs},
 			},
 			{
 				"enabled=true, name=nil",
@@ -148,19 +167,18 @@ func TestCustomDomain(t *testing.T) {
 				apidef.APIDefinition{DomainDisabled: false, Domain: ""},
 			},
 			{
-				"enabled=true, name=(valid-domain)",
-				Domain{Enabled: true, Name: "example.com"},
-				apidef.APIDefinition{DomainDisabled: false, Domain: "example.com"},
+				"enabled=true, valid",
+				Domain{Enabled: true, Name: "example.com", Certificates: certs},
+				apidef.APIDefinition{DomainDisabled: false, Domain: "example.com", Certificates: certs},
 			},
 		}
 
 		for _, tc := range testcases {
 			t.Run(tc.title, func(t *testing.T) {
 				var apiDef apidef.APIDefinition
-
 				tc.input.ExtractTo(&apiDef)
 
-				assert.Equal(t, tc.expectValue, apiDef)
+				assert.Equalf(t, tc.expectValue, apiDef, tc.title)
 			})
 		}
 	})
@@ -173,12 +191,12 @@ func TestCustomDomain(t *testing.T) {
 			{
 				"disabled=false, name=nil",
 				apidef.APIDefinition{DomainDisabled: false, Domain: ""},
-				Domain{},
+				Domain{Enabled: true},
 			},
 			{
-				"disabled=false, name=(valid-domain)",
-				apidef.APIDefinition{DomainDisabled: false, Domain: "example.com"},
-				Domain{Enabled: true, Name: "example.com"},
+				"disabled=false, valid",
+				apidef.APIDefinition{DomainDisabled: false, Domain: "example.com", Certificates: certs},
+				Domain{Enabled: true, Name: "example.com", Certificates: certs},
 			},
 			{
 				"disabled=true, name=nil",
@@ -186,9 +204,9 @@ func TestCustomDomain(t *testing.T) {
 				Domain{Enabled: false, Name: ""},
 			},
 			{
-				"disabled=true, name=(valid-domain)",
-				apidef.APIDefinition{DomainDisabled: true, Domain: "example.com"},
-				Domain{Enabled: false, Name: "example.com"},
+				"disabled=true, valid",
+				apidef.APIDefinition{DomainDisabled: true, Domain: "example.com", Certificates: certs},
+				Domain{Enabled: false, Name: "example.com", Certificates: certs},
 			},
 		}
 
@@ -239,12 +257,13 @@ func TestTagsExportServer(t *testing.T) {
 			apidef.APIDefinition{},
 			&GatewayTags{
 				Enabled: true,
-				Tags:    []string{},
+				Tags:    nil,
 			},
 		},
 	}
 
 	for _, tc := range testcases {
+		tc := tc
 		t.Run(tc.title, func(t *testing.T) {
 			t.Parallel()
 
@@ -254,4 +273,107 @@ func TestTagsExportServer(t *testing.T) {
 			assert.Equal(t, tc.expected, server.GatewayTags)
 		})
 	}
+}
+
+func TestFillDetailedTracing(t *testing.T) {
+	t.Parallel()
+
+	testcases := []struct {
+		title    string
+		input    apidef.APIDefinition
+		expected *DetailedTracing
+	}{
+		{
+			"enabled",
+			apidef.APIDefinition{DetailedTracing: true},
+			&DetailedTracing{Enabled: true},
+		},
+		{
+			"disabled",
+			apidef.APIDefinition{DetailedTracing: false},
+			nil,
+		},
+	}
+
+	for _, tc := range testcases {
+		tc := tc // Creating a new 'tc' scoped to the loop
+		t.Run(tc.title, func(t *testing.T) {
+			t.Parallel()
+
+			server := new(Server)
+			server.Fill(tc.input)
+
+			assert.Equal(t, tc.expected, server.DetailedTracing)
+		})
+	}
+}
+
+func TestExportDetailedTracing(t *testing.T) {
+	t.Parallel()
+
+	testcases := []struct {
+		title    string
+		input    *DetailedTracing
+		expected bool
+	}{
+		{
+			"enabled",
+			&DetailedTracing{Enabled: true},
+			true,
+		},
+		{
+			"disabled",
+			nil,
+			false,
+		},
+	}
+
+	for _, tc := range testcases {
+		tc := tc // Creating a new 'tc' scoped to the loop
+		t.Run(tc.title, func(t *testing.T) {
+			t.Parallel()
+
+			server := new(Server)
+			server.DetailedTracing = tc.input
+
+			var apiDef apidef.APIDefinition
+			server.ExtractTo(&apiDef)
+
+			assert.Equal(t, tc.expected, apiDef.DetailedTracing)
+		})
+	}
+}
+
+func TestIPAccessControl(t *testing.T) {
+	t.Run("empty", func(t *testing.T) {
+		var emptyIPAccessControl IPAccessControl
+
+		var convertedAPI apidef.APIDefinition
+		convertedAPI.SetDisabledFlags()
+		emptyIPAccessControl.ExtractTo(&convertedAPI)
+
+		var resultIPAccessControl IPAccessControl
+		resultIPAccessControl.Fill(convertedAPI)
+
+		assert.Equal(t, emptyIPAccessControl, resultIPAccessControl)
+	})
+
+	t.Run("valid", func(t *testing.T) {
+		ipAccessControl := IPAccessControl{
+			Enabled: true,
+			Allow:   []string{"127.0.0.1"},
+			Block:   []string{"10.0.0.1"},
+		}
+
+		var convertedAPI apidef.APIDefinition
+		convertedAPI.SetDisabledFlags()
+		ipAccessControl.ExtractTo(&convertedAPI)
+
+		assert.False(t, convertedAPI.IPAccessControlDisabled)
+
+		var resultIPAccessControl IPAccessControl
+		resultIPAccessControl.Fill(convertedAPI)
+
+		assert.Equal(t, ipAccessControl, resultIPAccessControl)
+	})
 }
